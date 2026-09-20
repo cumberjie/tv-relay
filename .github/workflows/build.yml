@@ -1,0 +1,87 @@
+name: Build APK
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+
+      - name: Test, lint, and build Debug APK
+        run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+
+      - name: Show APK size
+        run: ls -l app/build/outputs/apk/debug/
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TvRelay-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  # 正式签名版：仅在手动触发时构建。keystore 与密码只从 GitHub Secrets 读取，
+  # 不写入代码仓库。
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+
+      - name: Restore signing keystore
+        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > app/release-key.p12
+
+      - name: Write signing properties
+        run: |
+          printf 'storeFile=app/release-key.p12\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "${{ secrets.KEYSTORE_PASSWORD }}" "${{ secrets.KEY_ALIAS }}" "${{ secrets.KEY_PASSWORD }}" \
+            > keystore.properties
+
+      - name: Build signed Release APK
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Show APK size
+        run: ls -l app/build/outputs/apk/release/
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TvRelay-release
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
