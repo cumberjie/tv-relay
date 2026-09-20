@@ -28,20 +28,32 @@
 
 ## 从 GitHub Actions 下载 APK（不用本机环境）
 
-1. 打开仓库页面，进入 **Actions** 标签
-2. 左侧选择 **Build APK** 工作流，进入最近一次运行
-3. 页面底部 **Artifacts** 区域下载 zip，解压得到 APK
+## 从 GitHub Releases 下载 APK
 
-- **Debug 包**：push 到 main 即自动构建，用于快速验证。
-- **Release 包**：需要先在仓库 **Settings → Secrets and variables → Actions** 配置以下四项，
-  再手动触发（Actions 页面 → Build APK → Run workflow）：
+1. 打开仓库页面，进入 **Releases**
+2. 点开 **latest**（永远指向最新构建）
+3. 下载 `tv-relay-vX.Y.Z.apk`
 
-  | Secret 名 | 内容 |
-  | --- | --- |
-  | `ANDROID_KEYSTORE_BASE64` | keystore 文件的 base64 |
-  | `KEYSTORE_PASSWORD` | keystore 密码 |
-  | `KEY_ALIAS` | 密钥别名 |
-  | `KEY_PASSWORD` | 密钥密码 |
+**覆盖安装即升级**：签名一致，新 APK 直接覆盖旧版安装，无需卸载。
+
+### 构建触发方式（照抄 yuhu 项目）
+
+- **发版**：`git tag -a v1.0.1 && git push origin main v1.0.1` —— 自动构建并建立版本 Release
+- **只验证编译、不发版**：Actions 页面 → Android 构建 → Run workflow
+- push main **不再触发构建**，避免浪费构建额度
+
+### 签名配置（要可覆盖升级就必须配）
+
+在仓库 **Settings → Secrets and variables → Actions** 配置四项：
+
+| Secret 名 | 内容 |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | keystore 文件的 base64 |
+| `ANDROID_KEYSTORE_PASSWORD` | keystore 密码 |
+| `ANDROID_KEY_ALIAS` | 密钥别名 |
+| `ANDROID_KEY_PASSWORD` | 密钥密码 |
+
+未配置时构建仍会成功，但用的是临时 debug 签名，**那种包装上去后无法覆盖升级**。
 
 ## 本地构建（需要 JDK 17 + Android SDK）
 

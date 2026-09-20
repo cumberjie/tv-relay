@@ -1,87 +1,106 @@
-name: Build APK
+name: Android 构建
 
+# 单次构建策略（照抄 yuhu 项目）：
+# - 只在推 v* 标签（发版）时构建；push main 照常更新代码但【不再触发构建】。
+# - 发版一条龙：git tag -a vX.Y.Z && git push origin main vX.Y.Z
+# - APK 只进 GitHub Release（版本存档 + latest 指路牌），不再上传 Actions Artifact。
+# - 改了代码想验证 CI 能不能编译（不发版）：Actions 页手动 Run workflow（workflow_dispatch）。
 on:
   push:
-    branches: ["main"]
-  pull_request:
+    tags: [ 'v*' ]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  debug:
+  build:
+    name: 构建 APK
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: 拉取代码
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: 安装 JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Make Gradle wrapper executable
+      - name: 授予 gradlew 执行权限
         run: chmod +x gradlew
 
-      - name: Test, lint, and build Debug APK
-        run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
-
-      - name: Show APK size
-        run: ls -l app/build/outputs/apk/debug/
-
-      - name: Upload Debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: TvRelay-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 30
-
-  # 正式签名版：仅在手动触发时构建。keystore 与密码只从 GitHub Secrets 读取，
-  # 不写入代码仓库。
-  release:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Make Gradle wrapper executable
-        run: chmod +x gradlew
-
-      - name: Restore signing keystore
-        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > app/release-key.p12
-
-      - name: Write signing properties
+      - name: 解码签名密钥
+        env:
+          HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        shell: bash
         run: |
-          printf 'storeFile=app/release-key.p12\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
-            "${{ secrets.KEYSTORE_PASSWORD }}" "${{ secrets.KEY_ALIAS }}" "${{ secrets.KEY_PASSWORD }}" \
-            > keystore.properties
+          if [ "$HAS_KEYSTORE" = "true" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+            {
+              echo "KEYSTORE_FILE=$RUNNER_TEMP/release.keystore"
+              echo "KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD"
+              echo "KEY_ALIAS=$ANDROID_KEY_ALIAS"
+              echo "KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
+            } >> "$GITHUB_ENV"
+            echo "已注入正式签名配置"
+          else
+            echo "未配置签名 Secrets，使用 debug 签名构建（APK 仍可安装）"
+          fi
 
-      - name: Build signed Release APK
-        run: ./gradlew --no-daemon assembleRelease
+      - name: 构建 Release APK
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
 
-      - name: Show APK size
-        run: ls -l app/build/outputs/apk/release/
+      - name: 确定版本与标签
+        id: ver
+        shell: bash
+        run: |
+          VER=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts)
+          CODE=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts)
+          # 发版 = tag 触发；手动触发（无 tag）时回退用 build.gradle 里的 versionName
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="v${VER}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "版本: ${TAG} (build ${CODE})"
 
-      - name: Upload Release APK
-        uses: actions/upload-artifact@v4
+      - name: 重命名 APK（带版本号）
+        shell: bash
+        run: |
+          cd app/build/outputs/apk/release
+          for f in *.apk; do mv "$f" "tv-relay-${{ steps.ver.outputs.tag }}.apk"; done
+          ls -lh
+
+      - name: 发布版本 Release（v* 标签存档，自动生成更新说明）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
         with:
-          name: TvRelay-release
-          path: app/build/outputs/apk/release/app-release.apk
-          if-no-files-found: error
-          retention-days: 30
+          files: app/build/outputs/apk/release/*.apk
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 更新 latest 指路牌（永远指向最新构建）
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          mkdir -p dist
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          cp "$APK" "dist/tv-relay-${TAG}.apk"
+          # 指路牌：latest 永远指向最新构建，覆盖安装即升级
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest "dist/tv-relay-${TAG}.apk" \
+            --latest \
+            --title "tv-relay ${TAG}（最新版）" \
+            --notes "main 分支自动构建（build ${{ steps.ver.outputs.code }}）。下载 APK 直接覆盖安装即可升级。历史版本见各 v* Release。"

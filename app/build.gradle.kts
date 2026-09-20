@@ -1,17 +1,7 @@
-import java.util.Properties
+import java.io.File
 
 plugins {
     id("com.android.application")
-}
-
-// 签名配置：本地 keystore.properties（已被 .gitignore 排除，含密码，绝不提交）
-// CI 构建 Release 时由工作流从 GitHub Secrets 生成同名文件
-fun loadReleaseSigning(): Properties? {
-    val file = rootProject.file("keystore.properties")
-    if (!file.exists()) return null
-    val props = Properties()
-    file.inputStream().use { props.load(it) }
-    return props
 }
 
 android {
@@ -26,22 +16,24 @@ android {
         versionName = "1.0.0"
     }
 
+    // 统一签名通道（照抄 yuhu 项目）。
+    // CI 由 GitHub Secrets 注入环境变量：
+    //   KEYSTORE_FILE / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD
+    // 保证每次构建出的 APK 签名一致，电视上可直接覆盖安装升级。
+    // 本仓库是公开仓库，密钥库只存在于 Secrets 里，绝不写入代码仓库。
     signingConfigs {
         create("release") {
-            val props = loadReleaseSigning()
-            if (props != null) {
-                storeFile = rootProject.file(props.getProperty("storeFile"))
-                storePassword = props.getProperty("storePassword")
-                keyAlias = props.getProperty("keyAlias")
-                keyPassword = props.getProperty("keyPassword")
+            val path = System.getenv("KEYSTORE_FILE")
+            if (path != null && File(path).exists()) {
+                storeFile = File(path)
+                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: ""
+                keyAlias = System.getenv("KEY_ALIAS") ?: ""
+                keyPassword = System.getenv("KEY_PASSWORD") ?: ""
             }
         }
     }
 
     buildTypes {
-        debug {
-            isMinifyEnabled = false
-        }
         release {
             // R8 代码压缩 + 资源裁剪：减小 APK 与安装占用。
             // 项目零反射，manifest 声明的组件 AGP 会自动 keep。
@@ -51,11 +43,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = if (loadReleaseSigning() != null) {
+            signingConfig = if (File(System.getenv("KEYSTORE_FILE") ?: "").exists())
                 signingConfigs.getByName("release")
-            } else {
-                null
-            }
+            else
+                signingConfigs.getByName("debug")
         }
     }
 
