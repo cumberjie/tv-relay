@@ -3,8 +3,6 @@ package com.skyeward.tvrelay;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -16,22 +14,28 @@ import java.net.Socket;
  * 极简 HTTP 服务器，只认两个请求：
  * <pre>
  *   GET /         返回上传页
- *   PUT /upload   把请求体原样写入 dest
+ *   PUT /upload   把请求体流式交给 {@link Sink}
  * </pre>
  * 上传走"裸 body"，不用 multipart，服务端因此不需要解析任何边界。
+ * 本类不落盘、不碰文件：数据从 socket 直接流进 Sink 提供的输出流。
  */
 public final class TinyHttp implements Runnable {
 
+    /** 接收端：把请求体流式交给实现者（这里接的是系统安装会话）。 */
+    public interface Sink {
+        OutputStream open(long size) throws IOException;
+
+        void done(boolean ok);
+    }
+
     private final int port;
-    private final File dest;
-    private final Runnable onReceived;
+    private final Sink sink;
 
     private volatile ServerSocket server;
 
-    public TinyHttp(int port, File dest, Runnable onReceived) {
+    public TinyHttp(int port, Sink sink) {
         this.port = port;
-        this.dest = dest;
-        this.onReceived = onReceived;
+        this.sink = sink;
     }
 
     @Override
@@ -43,8 +47,10 @@ public final class TinyHttp implements Runnable {
                 Socket socket = server.accept();
                 try {
                     handle(socket);
-                } catch (IOException ignored) {
-                    // 单条连接出错不影响后续接收
+                } catch (Exception ignored) {
+                    // 单条连接出错不影响后续接收。
+                    // 这里必须 catch Exception 而不是 IOException：权限类异常是未受检的，
+                    // 漏出去会直接打死这个线程，服务器从此不再响应。
                 } finally {
                     close(socket);
                 }
@@ -94,11 +100,19 @@ public final class TinyHttp implements Runnable {
             out.write(page);
             out.flush();
         } else if ("PUT".equals(req[0]) && length > 0) {
-            receive(in, length);
-            header(out, "200 OK", null, 2);
-            out.write("OK".getBytes("ISO-8859-1"));
+            boolean ok = false;
+            try {
+                receive(in, length);
+                ok = true;
+            } catch (Exception ignored) {
+                // 失败原因已由 Sink 实现方显示到电视屏幕上
+            }
+            sink.done(ok);
+            header(out, ok ? "200 OK" : "500 Internal Server Error", null, ok ? 2 : 0);
+            if (ok) {
+                out.write("OK".getBytes("ISO-8859-1"));
+            }
             out.flush();
-            onReceived.run();
         } else {
             header(out, "404 Not Found", null, 0);
             out.flush();
@@ -106,10 +120,7 @@ public final class TinyHttp implements Runnable {
     }
 
     private void receive(InputStream in, long length) throws IOException {
-        if (dest.exists() && !dest.delete()) {
-            throw new IOException("无法清理旧文件: " + dest);
-        }
-        FileOutputStream fos = new FileOutputStream(dest);
+        OutputStream os = sink.open(length);
         try {
             byte[] buf = new byte[65536];
             long remaining = length;
@@ -118,11 +129,15 @@ public final class TinyHttp implements Runnable {
                 if (n < 0) {
                     break;
                 }
-                fos.write(buf, 0, n);
+                os.write(buf, 0, n);
                 remaining -= n;
             }
+            os.flush();
         } finally {
-            fos.close();
+            try {
+                os.close();
+            } catch (IOException ignored) {
+            }
         }
     }
 

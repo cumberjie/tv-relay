@@ -1,11 +1,12 @@
 package com.skyeward.tvrelay;
 
 import android.app.Activity;
+import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.net.Uri;
+import android.content.pm.PackageInstaller;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -15,30 +16,35 @@ import android.view.Gravity;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
-import java.io.File;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.util.Collections;
 
 /**
- * 打开即监听，返回即退出。不设 Service，不常驻。
+ * 打开即监听，返回即退出。不设 Service，不常驻，不落盘。
+ *
+ * <p>收到的 APK 数据直接流进系统安装会话，由系统自己在 /data/app-staging 里管理，
+ * 因此本应用没有任何"安装包文件"需要删除。
  */
-public class MainActivity extends Activity {
+public class MainActivity extends Activity implements TinyHttp.Sink {
 
     private static final int PORT = 8080;
+    private static final String STATUS_ACTION = "com.skyeward.tvrelay.ACTION_INSTALL_STATUS";
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private TextView status;
-    private File temp;
     private TinyHttp server;
     private Thread worker;
-    private BroadcastReceiver installDone;
+
+    private PackageInstaller.Session session;
+    private BroadcastReceiver statusReceiver;
 
     @Override
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
-        temp = new File(getCacheDir(), "received.apk");
 
         TextView url = new TextView(this);
         url.setText("http://" + lanIp() + ":" + PORT);
@@ -61,24 +67,24 @@ public class MainActivity extends Activity {
         root.addView(status);
         setContentView(root);
 
-        installDone = new BroadcastReceiver() {
+        statusReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
-                deleteTemp();
-                status.setText("已安装完成，临时文件已删除");
+                int st = intent.getIntExtra(PackageInstaller.EXTRA_STATUS,
+                        PackageInstaller.STATUS_FAILURE);
+                String msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+                status.setText(st == PackageInstaller.STATUS_SUCCESS
+                        ? "安装成功" : "安装失败：" + msg);
             }
         };
-        IntentFilter filter = new IntentFilter(Intent.ACTION_PACKAGE_ADDED);
-        filter.addAction(Intent.ACTION_PACKAGE_REPLACED);
-        // 少这一行，安装完成的广播永远收不到
-        filter.addDataScheme("package");
+        IntentFilter sf = new IntentFilter(STATUS_ACTION);
         if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(installDone, filter, Context.RECEIVER_NOT_EXPORTED);
+            registerReceiver(statusReceiver, sf, Context.RECEIVER_NOT_EXPORTED);
         } else {
-            registerReceiver(installDone, filter);
+            registerReceiver(statusReceiver, sf);
         }
 
-        server = new TinyHttp(PORT, temp, () -> ui.post(this::install));
+        server = new TinyHttp(PORT, this);
         worker = new Thread(server, "httpd");
         worker.start();
     }
@@ -92,34 +98,81 @@ public class MainActivity extends Activity {
         if (worker != null) {
             worker.interrupt();
         }
-        if (installDone != null) {
+        if (statusReceiver != null) {
             try {
-                unregisterReceiver(installDone);
+                unregisterReceiver(statusReceiver);
             } catch (Exception ignored) {
             }
         }
-        deleteTemp();
+        abandonSession();
         super.onDestroy();
     }
 
-    private void install() {
-        status.setText("接收完成，正在打开安装器…");
-        Intent intent = new Intent(Intent.ACTION_VIEW);
-        // 必须 setDataAndType：分开调 setData/setType 会互相清空
-        intent.setDataAndType(
-                Uri.parse("content://" + getPackageName() + ".apk/received.apk"),
-                "application/vnd.android.package-archive");
-        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+    // ---- TinyHttp.Sink：下面两个方法在 HTTP 工作线程上被调用 ----
+
+    @Override
+    public OutputStream open(long size) throws IOException {
+        abandonSession();
         try {
-            startActivity(intent);
+            PackageInstaller installer = getPackageManager().getPackageInstaller();
+            PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
+                    PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+            int sessionId = installer.createSession(params);
+            session = installer.openSession(sessionId);
+            return session.openWrite("base.apk", 0, size);
         } catch (Exception e) {
-            status.setText("打开安装器失败：" + e.getMessage());
+            final String why = e.getClass().getSimpleName() + ": " + e.getMessage();
+            ui.post(() -> status.setText("无法创建安装会话：" + why));
+            throw new IOException(e);
         }
     }
 
-    private void deleteTemp() {
-        if (temp != null && temp.exists()) {
-            temp.delete();
+    @Override
+    public void done(boolean ok) {
+        PackageInstaller.Session s = session;
+        session = null;
+        if (s == null) {
+            return;
+        }
+        if (!ok) {
+            try {
+                s.abandon();
+            } catch (Exception ignored) {
+            }
+            ui.post(() -> status.setText("接收失败，已放弃本次安装"));
+            return;
+        }
+        try {
+            Intent intent = new Intent(STATUS_ACTION);
+            // 必须同时带 UPDATE_CURRENT：单独传未知的 MUTABLE 位在旧版本上可能被拒
+            PendingIntent pi = PendingIntent.getBroadcast(this, 0, intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE);
+            s.commit(pi.getIntentSender());
+            ui.post(() -> status.setText("已提交安装，请在电视上确认"));
+        } catch (Exception e) {
+            try {
+                s.abandon();
+            } catch (Exception ignored) {
+            }
+            final String why = e.getClass().getSimpleName() + ": " + e.getMessage();
+            ui.post(() -> status.setText("提交安装失败：" + why));
+        } finally {
+            try {
+                s.close();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    /** 释放还没提交的安装会话，避免系统侧暂存配额泄漏。 */
+    private void abandonSession() {
+        PackageInstaller.Session s = session;
+        if (s != null) {
+            try {
+                s.abandon();
+            } catch (Exception ignored) {
+            }
+            session = null;
         }
     }
 
