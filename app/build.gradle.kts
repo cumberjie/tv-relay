@@ -12,8 +12,8 @@ android {
         applicationId = "com.skyeward.tvrelay"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 3
+        versionName = "1.0.2"
     }
 
     // 统一签名通道（照抄 yuhu 项目）。

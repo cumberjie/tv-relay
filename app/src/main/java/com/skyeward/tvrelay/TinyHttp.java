@@ -32,6 +32,8 @@ public final class TinyHttp implements Runnable {
     private final Sink sink;
 
     private volatile ServerSocket server;
+    /** stop() 可能跑在 run() 绑端口之前，那时 server 还是 null；只能靠这面旗子让线程自己收摊。 */
+    private volatile boolean stopped;
 
     public TinyHttp(int port, Sink sink) {
         this.port = port;
@@ -42,9 +44,19 @@ public final class TinyHttp implements Runnable {
     public void run() {
         try {
             // 必须绑 0.0.0.0，否则只能本机访问
-            server = new ServerSocket(port, 4, InetAddress.getByName("0.0.0.0"));
+            ServerSocket bound = new ServerSocket(port, 4, InetAddress.getByName("0.0.0.0"));
+            server = bound;
+            if (stopped) {
+                // stop() 早于绑定：这里必须自己关掉，否则 8080 被一个已经没人管的线程长期占住，
+                // 下次再打开 App 会 BindException，界面照常显示网址但根本没人监听。
+                bound.close();
+                return;
+            }
             while (true) {
-                Socket socket = server.accept();
+                Socket socket = bound.accept();
+                // 读没有超时：一条连上却不发数据的连接（浏览器预连接、Wi-Fi 半开连接）
+                // 就能让这个唯一的处理线程永远阻塞，服务器从此不再响应任何上传。
+                socket.setSoTimeout(30000);
                 try {
                     handle(socket);
                 } catch (Exception ignored) {
@@ -61,6 +73,7 @@ public final class TinyHttp implements Runnable {
     }
 
     public void stop() {
+        stopped = true;
         ServerSocket s = server;
         if (s != null) {
             try {
@@ -131,6 +144,11 @@ public final class TinyHttp implements Runnable {
                 }
                 os.write(buf, 0, n);
                 remaining -= n;
+            }
+            if (remaining > 0) {
+                // 手机断网/锁屏/点了取消：body 没传完。这里必须抛——不然会 commit 一份残缺 APK，
+                // 电视弹出安装器、用户确认，最后系统只报"解析包错误"，没人知道是传输断的。
+                throw new IOException("body truncated, " + remaining + " of " + length + " bytes missing");
             }
             os.flush();
         } finally {
@@ -214,8 +232,8 @@ public final class TinyHttp implements Runnable {
             + "if(!f){s.textContent='请先选择 APK 文件';return;}"
             + "var x=new XMLHttpRequest();x.open('PUT','/upload');"
             + "x.upload.onprogress=function(e){s.textContent='已发送 '+Math.round(e.loaded/e.total*100)+'%';};"
-            + "x.onload=function(){s.textContent='发送完成，请在电视上用遥控器确认安装';};"
-            + "x.onerror=function(){s.textContent='发送失败，请重试';};"
+            + "x.onload=function(){s.textContent=x.status===200?'发送完成，请在电视上用遥控器确认安装':'电视没接收成功（HTTP '+x.status+'），原因在电视屏幕上';};"
+            + "x.onerror=function(){s.textContent='发送失败，请看电视屏幕上的原因后重试';};"
             + "x.send(f);"
             + "}"
             + "</script>";

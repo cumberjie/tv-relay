@@ -39,7 +39,8 @@ public class MainActivity extends Activity implements TinyHttp.Sink {
     private TinyHttp server;
     private Thread worker;
 
-    private PackageInstaller.Session session;
+    // HTTP 线程写（open/done），UI 线程读（onDestroy）——必须 volatile
+    private volatile PackageInstaller.Session session;
     private BroadcastReceiver statusReceiver;
 
     @Override
@@ -53,7 +54,13 @@ public class MainActivity extends Activity implements TinyHttp.Sink {
         url.setGravity(Gravity.CENTER);
 
         status = new TextView(this);
-        status.setText("手机浏览器打开上面的网址，选 APK 发送");
+        // 没拿到"安装未知应用"授权时，createSession/commit 不会弹任何安装界面，
+        // 手机上却照样显示"发送完成"——用户只能对着没反应的电视干瞪眼。
+        // 与其猜，不如开屏就把真实原因摆在最显眼的地方。
+        status.setText(getPackageManager().canRequestPackageInstalls()
+                ? "手机浏览器打开上面的网址，选 APK 发送"
+                : "未授权安装：先到电视【设置 → 安全与限制 → 安装未知应用】里允许【传APK】，"
+                  + "否则传完不会弹出安装界面");
         status.setTextColor(0xFFD0D0D0);
         status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
         status.setGravity(Gravity.CENTER);
@@ -117,6 +124,8 @@ public class MainActivity extends Activity implements TinyHttp.Sink {
             PackageInstaller installer = getPackageManager().getPackageInstaller();
             PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
                     PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+            // 告诉系统这份包多大：预占安装空间，也让 openWrite 的长度校验对得上
+            params.setSize(size);
             int sessionId = installer.createSession(params);
             session = installer.openSession(sessionId);
             return session.openWrite("base.apk", 0, size);
