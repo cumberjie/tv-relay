@@ -27,6 +27,7 @@ android {
             if (path != null && File(path).exists()) {
                 storeFile = File(path)
                 storePassword = System.getenv("KEYSTORE_PASSWORD") ?: ""
+                storeType = "PKCS12"
                 keyAlias = System.getenv("KEY_ALIAS") ?: ""
                 keyPassword = System.getenv("KEY_PASSWORD") ?: ""
             }

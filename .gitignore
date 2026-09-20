@@ -20,3 +20,4 @@ secrets.json
 downloads/
 keystore.properties
 .workbuddy/
+keystore/
