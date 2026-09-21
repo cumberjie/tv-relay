@@ -25,15 +25,17 @@ public final class TinyHttp implements Runnable {
     private final int port;
     private final File dest;
     private final Runnable onReceived;
+    private final Runnable onListenFailed;
 
     private volatile ServerSocket server;
     /** stop() 可能跑在 run() 绑端口之前，那时 server 还是 null；只能靠这面旗子让线程自己收摊。 */
     private volatile boolean stopped;
 
-    public TinyHttp(int port, File dest, Runnable onReceived) {
+    public TinyHttp(int port, File dest, Runnable onReceived, Runnable onListenFailed) {
         this.port = port;
         this.dest = dest;
         this.onReceived = onReceived;
+        this.onListenFailed = onListenFailed;
     }
 
     @Override
@@ -63,8 +65,14 @@ public final class TinyHttp implements Runnable {
                     close(socket);
                 }
             }
-        } catch (IOException stopped) {
-            // stop() 关掉 ServerSocket 后 accept 抛异常退出，属正常路径
+        } catch (IOException e) {
+            // accept 抛异常退出属正常路径（stop() 关掉了 ServerSocket），
+            // 但「绑端口就失败」必须区分出来报给界面：否则界面照常显示网址，
+            // 手机却怎么连都连不上，用户完全无从排查。
+            // 参数名不能叫 stopped——那会遮蔽下面这个被 stop() 置位的旗子。
+            if (!stopped) {
+                onListenFailed.run();
+            }
         }
     }
 

@@ -64,8 +64,11 @@ public class MainActivity extends Activity {
         installDone = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
-                deleteTemp();
-                status.setText("已安装完成，临时文件已删除");
+                // 这里绝对不能删 received.apk：这条广播收的是"任何" App 的安装完成
+                // （代码里拿不到目标包名），而安装确认页可能正停在电视上等你按确认。
+                // 删早了，你按确认只会看到"解析软件包时出现问题"。
+                // 清理改由 onDestroy 和 TinyHttp.receive() 开头负责。
+                status.setText("检测到安装完成");
             }
         };
         IntentFilter filter = new IntentFilter(Intent.ACTION_PACKAGE_ADDED);
@@ -78,7 +81,8 @@ public class MainActivity extends Activity {
             registerReceiver(installDone, filter);
         }
 
-        server = new TinyHttp(PORT, temp, () -> ui.post(this::install));
+        server = new TinyHttp(PORT, temp, () -> ui.post(this::install),
+                () -> ui.post(this::listenFailed));
         worker = new Thread(server, "httpd");
         worker.start();
     }
@@ -115,6 +119,12 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             status.setText("打开安装器失败：" + e.getMessage());
         }
+    }
+
+    /** 8080 绑不上（上一个实例没退干净、或端口被别的 App 占着）：必须说出来，
+     *  否则界面照常显示网址，手机怎么连都连不上，完全无从排查。 */
+    private void listenFailed() {
+        status.setText("启动失败：8080 端口被占用，手机连不上。\n请按遥控器返回键退出 App，再重新打开。");
     }
 
     private void deleteTemp() {
