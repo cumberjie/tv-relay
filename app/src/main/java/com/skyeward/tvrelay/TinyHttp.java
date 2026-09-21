@@ -3,6 +3,8 @@ package com.skyeward.tvrelay;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -14,30 +16,24 @@ import java.net.Socket;
  * 极简 HTTP 服务器，只认两个请求：
  * <pre>
  *   GET /         返回上传页
- *   PUT /upload   把请求体流式交给 {@link Sink}
+ *   PUT /upload   把请求体原样写入 dest
  * </pre>
  * 上传走"裸 body"，不用 multipart，服务端因此不需要解析任何边界。
- * 本类不落盘、不碰文件：数据从 socket 直接流进 Sink 提供的输出流。
  */
 public final class TinyHttp implements Runnable {
 
-    /** 接收端：把请求体流式交给实现者（这里接的是系统安装会话）。 */
-    public interface Sink {
-        OutputStream open(long size) throws IOException;
-
-        void done(boolean ok);
-    }
-
     private final int port;
-    private final Sink sink;
+    private final File dest;
+    private final Runnable onReceived;
 
     private volatile ServerSocket server;
     /** stop() 可能跑在 run() 绑端口之前，那时 server 还是 null；只能靠这面旗子让线程自己收摊。 */
     private volatile boolean stopped;
 
-    public TinyHttp(int port, Sink sink) {
+    public TinyHttp(int port, File dest, Runnable onReceived) {
         this.port = port;
-        this.sink = sink;
+        this.dest = dest;
+        this.onReceived = onReceived;
     }
 
     @Override
@@ -113,19 +109,11 @@ public final class TinyHttp implements Runnable {
             out.write(page);
             out.flush();
         } else if ("PUT".equals(req[0]) && length > 0) {
-            boolean ok = false;
-            try {
-                receive(in, length);
-                ok = true;
-            } catch (Exception ignored) {
-                // 失败原因已由 Sink 实现方显示到电视屏幕上
-            }
-            sink.done(ok);
-            header(out, ok ? "200 OK" : "500 Internal Server Error", null, ok ? 2 : 0);
-            if (ok) {
-                out.write("OK".getBytes("ISO-8859-1"));
-            }
+            receive(in, length);
+            header(out, "200 OK", null, 2);
+            out.write("OK".getBytes("ISO-8859-1"));
             out.flush();
+            onReceived.run();
         } else {
             header(out, "404 Not Found", null, 0);
             out.flush();
@@ -133,7 +121,10 @@ public final class TinyHttp implements Runnable {
     }
 
     private void receive(InputStream in, long length) throws IOException {
-        OutputStream os = sink.open(length);
+        if (dest.exists() && !dest.delete()) {
+            throw new IOException("无法清理旧文件: " + dest);
+        }
+        FileOutputStream fos = new FileOutputStream(dest);
         try {
             byte[] buf = new byte[65536];
             long remaining = length;
@@ -142,20 +133,16 @@ public final class TinyHttp implements Runnable {
                 if (n < 0) {
                     break;
                 }
-                os.write(buf, 0, n);
+                fos.write(buf, 0, n);
                 remaining -= n;
             }
             if (remaining > 0) {
-                // 手机断网/锁屏/点了取消：body 没传完。这里必须抛——不然会 commit 一份残缺 APK，
-                // 电视弹出安装器、用户确认，最后系统只报"解析包错误"，没人知道是传输断的。
+                // 手机断网/锁屏/点了取消：body 没传完。这里必须抛——抛出后 onReceived 不会执行，
+                // 也就不会把一个残缺的 APK 交给安装器（用户确认后只会看到"解析包错误"）。
                 throw new IOException("body truncated, " + remaining + " of " + length + " bytes missing");
             }
-            os.flush();
         } finally {
-            try {
-                os.close();
-            } catch (IOException ignored) {
-            }
+            fos.close();
         }
     }
 
@@ -232,8 +219,8 @@ public final class TinyHttp implements Runnable {
             + "if(!f){s.textContent='请先选择 APK 文件';return;}"
             + "var x=new XMLHttpRequest();x.open('PUT','/upload');"
             + "x.upload.onprogress=function(e){s.textContent='已发送 '+Math.round(e.loaded/e.total*100)+'%';};"
-            + "x.onload=function(){s.textContent=x.status===200?'发送完成，请在电视上用遥控器确认安装':'电视没接收成功（HTTP '+x.status+'），原因在电视屏幕上';};"
-            + "x.onerror=function(){s.textContent='发送失败，请看电视屏幕上的原因后重试';};"
+            + "x.onload=function(){s.textContent='发送完成，请在电视上用遥控器确认安装';};"
+            + "x.onerror=function(){s.textContent='发送失败，请重试';};"
             + "x.send(f);"
             + "}"
             + "</script>";

@@ -1,8 +1,7 @@
 # 传APK（TV 接收器）
 
 给电视用的**极简 APK 接收器**。打开应用即启动一个 HTTP 服务器，手机用浏览器把 APK
-传过去，电视自动弹出安装器。**数据直接流进系统安装区，不落盘、不留安装包。**
-按返回键退出即释放，**不设常驻服务**。
+传过去，电视自动弹出安装器，装完删掉临时文件。按返回键退出即释放，**不设常驻服务**。
 
 - 系统要求：**Android 8.0（API 26）及以上**
 - 技术栈：**纯 Java + 原生系统 API**，不引入 Kotlin / AndroidX / Compose / 任何第三方库
@@ -14,7 +13,7 @@
 2. 手机连**同一个 Wi-Fi**，用浏览器打开那个网址（手机上不用装任何 App）
 3. 页面上选择 APK 文件，点「发送并安装」
 4. 电视自动弹出安装器，用遥控器确认安装
-5. 装完后没有任何安装包残留 —— 数据全程由系统托管，本应用不写任何文件
+5. 装完后 App 自动删除接收到的临时文件
 6. 不用时按遥控器返回键退出，HTTP 服务器随之关闭
 
 ## 两个权限，为什么需要
@@ -25,7 +24,7 @@
    - 用途：拉起系统安装器。Android 8.0 起这是必需项。
    - 首次使用需要在系统设置里允许本应用安装其他应用，**这是安卓的安全底线，绕不过去**。
 
-> 本应用不申请任何存储权限：收到的数据直接流进系统安装区，不写任何文件。
+> 本应用不申请任何存储权限：接收的临时文件放在应用自己的缓存目录里。
 
 ## 从 GitHub Releases 下载 APK
 
@@ -70,8 +69,9 @@
 app/src/main/
 ├─ AndroidManifest.xml
 ├─ java/com/skyeward/tvrelay/
-│  ├─ MainActivity.java    界面、启停服务器、把数据流接进系统安装会话
-│  └─ TinyHttp.java        手写 ServerSocket HTTP 服务器（只认 GET / 和 PUT /upload）
+│  ├─ MainActivity.java    界面、启停服务器、触发安装、删除临时文件
+│  ├─ TinyHttp.java        手写 ServerSocket HTTP 服务器（只认 GET / 和 PUT /upload）
+│  └─ ApkProvider.java     手写 ContentProvider，替代 AndroidX FileProvider
 └─ res/
    ├─ drawable/ic_launcher.xml
    ├─ drawable/tv_banner.xml
