@@ -24,6 +24,8 @@ import java.util.function.Consumer;
  * 上传走"裸 body"，不用 multipart，服务端因此不需要解析任何边界。
  * 每次上传各存一个独立文件（received-随机数.apk）：装 A 的时候手机又传了 B，
  * 两份文件互不覆盖，安装器读到的永远是当初那一份。
+ * 上一次运行若是被系统直接杀掉（没走 onDestroy 的清理），它收到的包会留在缓存目录里；
+ * 本实例一绑上端口就把这些没人认领的 received-* 清掉，不让残留赖着不走。
  */
 public final class TinyHttp implements Runnable {
 
@@ -42,7 +44,8 @@ public final class TinyHttp implements Runnable {
     private volatile boolean stopped;
     /** 正在处理的那条连接：stop() 要把它也关掉，卡在 read() 里的线程才会立刻解开。 */
     private volatile Socket active;
-    /** 本实例产生的文件（含写到一半的）：退出时只清理这些，不动别的实例留下的东西。 */
+    /** 本实例产生的文件（含写到一半的）：退出时只清理这些，不动别的实例留下的东西。
+     *  上次被系统杀掉的那个实例留下的文件不在这里，由启动时的 sweepOrphans() 收拾。 */
     private final CopyOnWriteArrayList<File> owned = new CopyOnWriteArrayList<>();
 
     public TinyHttp(int port, File directory, Consumer<File> onReceived, Runnable onListenFailed) {
@@ -64,6 +67,8 @@ public final class TinyHttp implements Runnable {
                 // 这条路径不算启动失败，不要回调界面报"端口被占用"。
                 return;
             }
+            // 上一次运行被系统杀掉时留下的包在这里先清掉：新实例的名单认识不了它们
+            sweepOrphans();
             while (true) {
                 Socket socket = bound.accept();
                 active = socket;
@@ -108,6 +113,32 @@ public final class TinyHttp implements Runnable {
             file.delete();
         }
         owned.clear();
+    }
+
+    /** 最近一次收完的文件；stop() 之后返回 null。界面上的「重新安装上一个包」用它。 */
+    public File lastReceived() {
+        return owned.isEmpty() ? null : owned.get(owned.size() - 1);
+    }
+
+    /**
+     * 清掉上一次运行留下的孤儿文件（received-*.apk / received-*.part）。
+     * 上一次若是被系统直接杀掉（不走 onDestroy），它收到的包就留在缓存里，而新开的实例
+     * 手里是一份空名单，永远认不出这些东西，残留只能靠系统清缓存带走。
+     * 绑上端口＝确定没有第二个实例在跑，此刻清掉最安全：目录里这些文件全是没人认领的，
+     * 也不会碰到正在上传或正等着安装的那一份。
+     */
+    private void sweepOrphans() {
+        File[] files = directory.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File file : files) {
+            String name = file.getName();
+            // 只认自己生成的文件名；目录里别的文件一律不动
+            if (name.startsWith("received-") && (name.endsWith(".apk") || name.endsWith(".part"))) {
+                file.delete();
+            }
+        }
     }
 
     private void handle(Socket socket) throws IOException {

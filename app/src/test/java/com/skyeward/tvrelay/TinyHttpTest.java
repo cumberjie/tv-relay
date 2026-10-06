@@ -238,7 +238,7 @@ public class TinyHttpTest {
         worker.join(1500);
         assertFalse(worker.isAlive());
         assertFalse("本实例收到的文件随退出清理", apk.exists());
-        assertTrue("别的实例留下的文件不许动", foreign.exists());
+        assertTrue("stop() 只清本实例收到的文件，这个不是它收的", foreign.exists());
     }
 
     @Test
@@ -270,6 +270,41 @@ public class TinyHttpTest {
             assertFalse(duplicateWorker.isAlive());
         } finally {
             duplicate.stop();
+        }
+    }
+
+    @Test
+    public void startupSweepsLeftoversFromAKilledInstance() throws Exception {
+        server.stop();
+        worker.join(3000);
+        File orphanApk = new File(directory, "received-999.apk");
+        File orphanPart = new File(directory, "received-999.part");
+        File unrelated = new File(directory, "unrelated.txt");
+        Files.write(orphanApk.toPath(), new byte[] { 1 });
+        Files.write(orphanPart.toPath(), new byte[] { 1 });
+        Files.write(unrelated.toPath(), new byte[] { 1 });
+        start(directory);
+        // 服务器先扫残留、后进 accept 循环：能拿到 200 就说明已经扫完了
+        assertStatus("200 OK", request("GET / HTTP/1.1\r\n\r\n"));
+        assertFalse("上次被系统杀掉留下的包，下次打开就该清掉", orphanApk.exists());
+        assertFalse("写了一半的半成品也不能留", orphanPart.exists());
+        assertTrue("只清自己生成的 received-*，别的文件不动", unrelated.exists());
+    }
+
+    @Test
+    public void keepsLeftoversWhenAnotherInstanceStillHoldsThePort() throws Exception {
+        File orphan = new File(directory, "received-777.apk");
+        Files.write(orphan.toPath(), new byte[] { 1 });
+        CountDownLatch occupied = new CountDownLatch(1);
+        TinyHttp second = new TinyHttp(port, directory, received::add, occupied::countDown);
+        Thread secondWorker = new Thread(second, "second-httpd");
+        secondWorker.start();
+        try {
+            assertTrue("第二个实例绑不上端口", occupied.await(3, TimeUnit.SECONDS));
+            assertTrue("端口还被占着＝还有实例在跑，此刻不许清目录里的包", orphan.exists());
+        } finally {
+            second.stop();
+            secondWorker.join(1500);
         }
     }
 

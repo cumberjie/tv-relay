@@ -12,6 +12,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -58,6 +59,14 @@ public class MainActivity extends Activity {
         root.setBackgroundColor(0xFF101014);
         root.addView(url);
         root.addView(status);
+
+        // 装失败后不用把包重传一遍：遥控器选中这个按钮按一下，最近收到的那个包会再交给安装器。
+        // 包只活到退出 App 为止（退出即清理），所以这个按钮只在本次打开期间有用。
+        Button reinstall = new Button(this);
+        reinstall.setText("重新安装上一个包");
+        reinstall.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        reinstall.setOnClickListener(v -> reinstallLast());
+        root.addView(reinstall);
         setContentView(root);
 
         installDone = new BroadcastReceiver() {
@@ -81,7 +90,7 @@ public class MainActivity extends Activity {
         }
 
         server = new TinyHttp(PORT, getCacheDir(),
-                file -> ui.post(() -> install(file)),
+                file -> ui.post(() -> install(file, "接收完成")),
                 () -> ui.post(this::listenFailed));
         worker = new Thread(server, "httpd");
         worker.start();
@@ -108,12 +117,12 @@ public class MainActivity extends Activity {
         super.onDestroy();
     }
 
-    /** 收完一个文件就弹安装器。file 是这次上传自己的文件，不是"最新那份"。 */
-    private void install(File apk) {
+    /** 弹安装器。file 是这次上传自己的文件，不是"最新那份"；action 用来说明这次为什么装。 */
+    private void install(File apk, String action) {
         if (destroyed) {
             return;
         }
-        status.setText("接收完成，正在打开安装器…");
+        status.setText(action + "，正在打开安装器…");
         Intent intent = new Intent(Intent.ACTION_VIEW);
         // 必须 setDataAndType：分开调 setData/setType 会互相清空
         intent.setDataAndType(
@@ -125,6 +134,19 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             status.setText("打开安装器失败：" + e.getMessage());
         }
+    }
+
+    /** 「重新安装上一个包」：把最近收到的那个包再交给安装器，省得在手机上重传一遍。 */
+    private void reinstallLast() {
+        if (destroyed) {
+            return;
+        }
+        File apk = server == null ? null : server.lastReceived();
+        if (apk == null || !apk.exists()) {
+            status.setText("还没收到过安装包（或上次的包已随退出清理）：先用手机传一个");
+            return;
+        }
+        install(apk, "重装上一个包");
     }
 
     /** 8080 绑不上（上一个实例没退干净、或端口被别的 App 占着）：必须说出来，
