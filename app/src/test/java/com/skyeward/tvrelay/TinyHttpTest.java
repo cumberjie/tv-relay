@@ -308,6 +308,19 @@ public class TinyHttpTest {
         }
     }
 
+    @Test
+    public void lastReceivedIsNewestUploadUntilStopClearsIt() throws Exception {
+        assertNull("还没收到过包时没有可重装的", server.lastReceived());
+        assertStatus("200 OK", request("PUT /upload HTTP/1.1\r\nContent-Length: 3\r\n\r\nAAA"));
+        File first = takeApk();
+        assertEquals("重装要拿最近收到的那个", first, server.lastReceived());
+        assertStatus("200 OK", request("PUT /upload HTTP/1.1\r\nContent-Length: 3\r\n\r\nBBB"));
+        File second = takeApk();
+        assertEquals("又收到一个，就该指向新的那个", second, server.lastReceived());
+        server.stop();
+        assertNull("退出后没有可重装的包了", server.lastReceived());
+    }
+
     private Socket connect() throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
         while (true) {

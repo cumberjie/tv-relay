@@ -213,6 +213,8 @@ public final class TinyHttp implements Runnable {
         if (stopped) {
             // 收完的瞬间用户退出了 App：不留文件、不弹安装器。
             apk.delete();
+            // 名单里也别留：留着会让 lastReceived() 拿到一个已经删掉的文件
+            owned.remove(apk);
             return;
         }
         respond(out, "200 OK");

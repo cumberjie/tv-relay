@@ -75,7 +75,8 @@ public class MainActivity extends Activity {
                 // 这里绝对不能删收到的 APK：这条广播收的是"任何" App 的安装完成
                 // （代码里拿不到目标包名），而安装确认页可能正停在电视上等你按确认。
                 // 删早了，你按确认只会看到"解析软件包时出现问题"。
-                // 清理统一由退出 App 时的 TinyHttp.stop() 负责。
+                // 本实例收到的文件由退出时的 TinyHttp.stop() 清；上次被系统杀掉留下的残留，
+                // 由下次启动服务器时的 sweepOrphans() 清掉——都不靠这条广播。
                 status.setText("检测到安装完成");
             }
         };
