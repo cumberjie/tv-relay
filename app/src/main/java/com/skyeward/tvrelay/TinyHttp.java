@@ -3,6 +3,7 @@ package com.skyeward.tvrelay;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -11,29 +12,42 @@ import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
 
 /**
  * 极简 HTTP 服务器，只认两个请求：
  * <pre>
  *   GET /         返回上传页
- *   PUT /upload   把请求体原样写入 dest
+ *   PUT /upload   把请求体原样写进 directory 下的一个新文件
  * </pre>
  * 上传走"裸 body"，不用 multipart，服务端因此不需要解析任何边界。
+ * 每次上传各存一个独立文件（received-随机数.apk）：装 A 的时候手机又传了 B，
+ * 两份文件互不覆盖，安装器读到的永远是当初那一份。
  */
 public final class TinyHttp implements Runnable {
 
+    /** 单次上传上限 512 MiB：再大就直接 413，别把电视缓存写满。 */
+    static final long MAX_UPLOAD = 512L * 1024 * 1024;
+    /** 写盘前至少留这么多可用空间，不够就 507。 */
+    static final long RESERVE = 32L * 1024 * 1024;
+
     private final int port;
-    private final File dest;
-    private final Runnable onReceived;
+    private final File directory;
+    private final Consumer<File> onReceived;
     private final Runnable onListenFailed;
 
     private volatile ServerSocket server;
     /** stop() 可能跑在 run() 绑端口之前，那时 server 还是 null；只能靠这面旗子让线程自己收摊。 */
     private volatile boolean stopped;
+    /** 正在处理的那条连接：stop() 要把它也关掉，卡在 read() 里的线程才会立刻解开。 */
+    private volatile Socket active;
+    /** 本实例产生的文件（含写到一半的）：退出时只清理这些，不动别的实例留下的东西。 */
+    private final CopyOnWriteArrayList<File> owned = new CopyOnWriteArrayList<>();
 
-    public TinyHttp(int port, File dest, Runnable onReceived, Runnable onListenFailed) {
+    public TinyHttp(int port, File directory, Consumer<File> onReceived, Runnable onListenFailed) {
         this.port = port;
-        this.dest = dest;
+        this.directory = directory;
         this.onReceived = onReceived;
         this.onListenFailed = onListenFailed;
     }
@@ -45,23 +59,30 @@ public final class TinyHttp implements Runnable {
             ServerSocket bound = new ServerSocket(port, 4, InetAddress.getByName("0.0.0.0"));
             server = bound;
             if (stopped) {
-                // stop() 早于绑定：这里必须自己关掉，否则 8080 被一个已经没人管的线程长期占住，
+                // stop() 早于绑定：这里得自己收摊，否则 8080 被一个已经没人管的线程长期占住，
                 // 下次再打开 App 会 BindException，界面照常显示网址但根本没人监听。
-                bound.close();
+                // 这条路径不算启动失败，不要回调界面报"端口被占用"。
                 return;
             }
             while (true) {
                 Socket socket = bound.accept();
+                active = socket;
+                if (stopped) {
+                    // accept() 返回和 stop() 之间抢了一拍：连接的登记晚于关服务器，自己补一刀。
+                    close(socket);
+                    return;
+                }
                 // 读没有超时：一条连上却不发数据的连接（浏览器预连接、Wi-Fi 半开连接）
                 // 就能让这个唯一的处理线程永远阻塞，服务器从此不再响应任何上传。
                 socket.setSoTimeout(30000);
                 try {
                     handle(socket);
                 } catch (Exception ignored) {
-                    // 单条连接出错不影响后续接收。
+                    // 单条连接出错不影响后续接收；stop() 关掉连接也走这里。
                     // 这里必须 catch Exception 而不是 IOException：权限类异常是未受检的，
                     // 漏出去会直接打死这个线程，服务器从此不再响应。
                 } finally {
+                    active = null;
                     close(socket);
                 }
             }
@@ -73,18 +94,20 @@ public final class TinyHttp implements Runnable {
             if (!stopped) {
                 onListenFailed.run();
             }
+        } finally {
+            close(server);
         }
     }
 
+    /** 关掉监听和正在处理的那条连接，并删掉本实例接收的文件。用户按返回键退出时调用。 */
     public void stop() {
         stopped = true;
-        ServerSocket s = server;
-        if (s != null) {
-            try {
-                s.close();
-            } catch (IOException ignored) {
-            }
+        close(server);
+        close(active);
+        for (File file : owned) {
+            file.delete();
         }
+        owned.clear();
     }
 
     private void handle(Socket socket) throws IOException {
@@ -97,61 +120,139 @@ public final class TinyHttp implements Runnable {
         }
         String[] req = parseRequestLine(requestLine);
         if (req == null) {
+            respond(out, "400 Bad Request");
             return;
         }
+        String method = req[0];
+        String path = req[1];
 
-        long length = 0;
+        long length = -1;
+        boolean repeatedLength = false;
+        boolean chunked = false;
         String header;
         while ((header = readLine(in)) != null && !header.isEmpty()) {
             if (header.regionMatches(true, 0, "Content-Length:", 0, 15)) {
-                try {
-                    length = Long.parseLong(header.substring(15).trim());
-                } catch (NumberFormatException ignored) {
+                if (length >= 0) {
+                    repeatedLength = true;
                 }
+                length = parseLength(header.substring(15));
+            } else if (header.regionMatches(true, 0, "Transfer-Encoding:", 0, 18)) {
+                chunked = true;
             }
         }
 
-        if ("GET".equals(req[0])) {
+        if ("GET".equals(method)) {
+            if (!"/".equals(path)) {
+                respond(out, "404 Not Found");
+                return;
+            }
             byte[] page = PAGE.getBytes("UTF-8");
             header(out, "200 OK", "Content-Type: text/html; charset=utf-8", page.length);
             out.write(page);
             out.flush();
-        } else if ("PUT".equals(req[0]) && length > 0) {
-            receive(in, length);
-            header(out, "200 OK", null, 2);
-            out.write("OK".getBytes("ISO-8859-1"));
-            out.flush();
-            onReceived.run();
-        } else {
-            header(out, "404 Not Found", null, 0);
-            out.flush();
+            return;
+        }
+        if (!"PUT".equals(method) || !"/upload".equals(path)) {
+            respond(out, "404 Not Found");
+            return;
+        }
+        if (length <= 0 || repeatedLength || chunked) {
+            // 没写长度、长度非法、长度写了两遍、又声明 chunked：一律当坏请求。
+            // 宁可让手机重传，也不猜一个大小就开始写文件。
+            respond(out, "400 Bad Request");
+            return;
+        }
+        if (length > MAX_UPLOAD) {
+            respond(out, "413 Payload Too Large");
+            return;
+        }
+        if (directory.getUsableSpace() < length + RESERVE) {
+            respond(out, "507 Insufficient Storage");
+            return;
+        }
+        File apk;
+        try {
+            apk = receive(in, length);
+        } catch (IOException truncated) {
+            // 手机断网/锁屏/点了取消：body 没传完。半成品已经在 receive() 里删掉，
+            // 这里回失败，手机页面不会再显示"发送完成"，也不会通知安装器。
+            respond(out, "400 Bad Request");
+            return;
+        }
+        if (stopped) {
+            // 收完的瞬间用户退出了 App：不留文件、不弹安装器。
+            apk.delete();
+            return;
+        }
+        respond(out, "200 OK");
+        onReceived.accept(apk);
+    }
+
+    /**
+     * 把 body 写进目录下的临时文件，收满 length 个字节才改名成 .apk 返回。
+     * 中途断了、超时了、改名失败，都会把半成品删掉——残缺的 APK 绝不流到安装器。
+     */
+    private File receive(InputStream in, long length) throws IOException {
+        File part = File.createTempFile("received-", ".part", directory);
+        boolean completed = false;
+        try {
+            FileOutputStream fos = new FileOutputStream(part);
+            try {
+                byte[] buf = new byte[65536];
+                long remaining = length;
+                while (remaining > 0) {
+                    int n = in.read(buf, 0, (int) Math.min(buf.length, remaining));
+                    if (n < 0) {
+                        break;
+                    }
+                    fos.write(buf, 0, n);
+                    remaining -= n;
+                }
+                if (remaining > 0) {
+                    // 抛出后 onReceived 不执行，也就不会把残缺的 APK 交给安装器
+                    // （用户确认后只会看到"解析包错误"）。
+                    throw new IOException("body truncated, " + remaining + " of " + length + " bytes missing");
+                }
+            } finally {
+                fos.close();
+            }
+            String name = part.getName();
+            File apk = new File(directory, name.substring(0, name.length() - ".part".length()) + ".apk");
+            if (!part.renameTo(apk)) {
+                throw new IOException("改名失败: " + part);
+            }
+            completed = true;
+            owned.add(apk);
+            return apk;
+        } finally {
+            if (!completed) {
+                part.delete();
+            }
         }
     }
 
-    private void receive(InputStream in, long length) throws IOException {
-        if (dest.exists() && !dest.delete()) {
-            throw new IOException("无法清理旧文件: " + dest);
+    /** 只认纯十进制数字的 Content-Length；+1、-1、空串、溢出都返回 -1（非法）。 */
+    private static long parseLength(String value) {
+        String text = value.trim();
+        if (text.isEmpty() || text.length() > 18) {
+            return -1;
         }
-        FileOutputStream fos = new FileOutputStream(dest);
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c < '0' || c > '9') {
+                return -1;
+            }
+        }
         try {
-            byte[] buf = new byte[65536];
-            long remaining = length;
-            while (remaining > 0) {
-                int n = in.read(buf, 0, (int) Math.min(buf.length, remaining));
-                if (n < 0) {
-                    break;
-                }
-                fos.write(buf, 0, n);
-                remaining -= n;
-            }
-            if (remaining > 0) {
-                // 手机断网/锁屏/点了取消：body 没传完。这里必须抛——抛出后 onReceived 不会执行，
-                // 也就不会把一个残缺的 APK 交给安装器（用户确认后只会看到"解析包错误"）。
-                throw new IOException("body truncated, " + remaining + " of " + length + " bytes missing");
-            }
-        } finally {
-            fos.close();
+            return Long.parseLong(text);
+        } catch (NumberFormatException tooBig) {
+            return -1;
         }
+    }
+
+    private static void respond(OutputStream out, String status) throws IOException {
+        header(out, status, null, 0);
+        out.flush();
     }
 
     private static void header(OutputStream out, String status, String extra, int length)
@@ -199,10 +300,12 @@ public final class TinyHttp implements Runnable {
         return new String[] { parts[0], parts[1] };
     }
 
-    private static void close(Socket socket) {
-        try {
-            socket.close();
-        } catch (IOException ignored) {
+    private static void close(Closeable target) {
+        if (target != null) {
+            try {
+                target.close();
+            } catch (IOException ignored) {
+            }
         }
     }
 
@@ -215,20 +318,25 @@ public final class TinyHttp implements Runnable {
             + "h3{font-weight:500}"
             + "input,button{font-size:1.05em;padding:.7em;margin:.4em 0;width:100%;box-sizing:border-box;border-radius:8px;border:1px solid #333;background:#1b1b20;color:#e8e8e8}"
             + "button{background:#0f6e56;border:0;color:#fff}"
+            + "button:disabled{background:#2a3b36;color:#8a8a8a}"
             + "#s{color:#9fe1cb;min-height:1.5em}"
             + "</style>"
             + "<h3>传 APK 到电视</h3>"
             + "<input type=file id=f>"
-            + "<button onclick=go()>发送并安装</button>"
+            + "<button id=b onclick=go()>发送并安装</button>"
             + "<p id=s></p>"
             + "<script>"
             + "function go(){"
-            + "var f=document.getElementById('f').files[0],s=document.getElementById('s');"
+            + "var f=document.getElementById('f').files[0],s=document.getElementById('s'),b=document.getElementById('b');"
             + "if(!f){s.textContent='请先选择 APK 文件';return;}"
             + "var x=new XMLHttpRequest();x.open('PUT','/upload');"
             + "x.upload.onprogress=function(e){s.textContent='已发送 '+Math.round(e.loaded/e.total*100)+'%';};"
-            + "x.onload=function(){s.textContent='发送完成，请在电视上用遥控器确认安装';};"
-            + "x.onerror=function(){s.textContent='发送失败，请重试';};"
+            + "x.onload=function(){"
+            + "b.disabled=false;"
+            + "s.textContent=x.status>=200&&x.status<300?'发送完成，请在电视上用遥控器确认安装':'发送失败（电视返回 '+x.status+'），请重试';"
+            + "};"
+            + "x.onerror=function(){b.disabled=false;s.textContent='发送失败，请重试';};"
+            + "b.disabled=true;"
             + "x.send(f);"
             + "}"
             + "</script>";

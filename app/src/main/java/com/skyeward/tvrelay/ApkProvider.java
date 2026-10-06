@@ -16,6 +16,9 @@ import java.io.FileNotFoundException;
  */
 public class ApkProvider extends ContentProvider {
 
+    /** 只放行 TinyHttp 生成的文件名：received-<随机数>.apk；别的名字一律拒绝。 */
+    private static final String RECEIVED_NAME = "received-[0-9A-Za-z-]+\\.apk";
+
     @Override
     public boolean onCreate() {
         return true;
@@ -23,7 +26,15 @@ public class ApkProvider extends ContentProvider {
 
     @Override
     public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
-        File apk = new File(getContext().getCacheDir(), "received.apk");
+        if (!"r".equals(mode)) {
+            throw new FileNotFoundException("只读打开: " + mode);
+        }
+        // URI 来自安装器（外部进程），只认本应用生成的文件名，绝不拿它去拼路径
+        String name = uri.getLastPathSegment();
+        if (name == null || !name.matches(RECEIVED_NAME)) {
+            throw new FileNotFoundException("不允许的路径: " + uri);
+        }
+        File apk = new File(getContext().getCacheDir(), name);
         return ParcelFileDescriptor.open(apk, ParcelFileDescriptor.MODE_READ_ONLY);
     }
 

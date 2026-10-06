@@ -30,7 +30,7 @@ public class MainActivity extends Activity {
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private TextView status;
-    private File temp;
+    private volatile boolean destroyed;
     private TinyHttp server;
     private Thread worker;
     private BroadcastReceiver installDone;
@@ -38,7 +38,6 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle saved) {
         super.onCreate(saved);
-        temp = new File(getCacheDir(), "received.apk");
 
         TextView url = new TextView(this);
         url.setText("http://" + lanIp() + ":" + PORT);
@@ -64,10 +63,10 @@ public class MainActivity extends Activity {
         installDone = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
-                // 这里绝对不能删 received.apk：这条广播收的是"任何" App 的安装完成
+                // 这里绝对不能删收到的 APK：这条广播收的是"任何" App 的安装完成
                 // （代码里拿不到目标包名），而安装确认页可能正停在电视上等你按确认。
                 // 删早了，你按确认只会看到"解析软件包时出现问题"。
-                // 清理改由 onDestroy 和 TinyHttp.receive() 开头负责。
+                // 清理统一由退出 App 时的 TinyHttp.stop() 负责。
                 status.setText("检测到安装完成");
             }
         };
@@ -81,7 +80,8 @@ public class MainActivity extends Activity {
             registerReceiver(installDone, filter);
         }
 
-        server = new TinyHttp(PORT, temp, () -> ui.post(this::install),
+        server = new TinyHttp(PORT, getCacheDir(),
+                file -> ui.post(() -> install(file)),
                 () -> ui.post(this::listenFailed));
         worker = new Thread(server, "httpd");
         worker.start();
@@ -89,9 +89,12 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        // 退出后迟到的接收回调一律不理会（服务器线程可能刚 post 了一个安装任务）
+        destroyed = true;
+        ui.removeCallbacksAndMessages(null);
         // accept() 阻塞只能靠关 socket 解开，interrupt 打不断
         if (server != null) {
-            server.stop();
+            server.stop();   // 顺带关掉正在上传的连接、删掉本次收到的文件
         }
         if (worker != null) {
             worker.interrupt();
@@ -102,16 +105,19 @@ public class MainActivity extends Activity {
             } catch (Exception ignored) {
             }
         }
-        deleteTemp();
         super.onDestroy();
     }
 
-    private void install() {
+    /** 收完一个文件就弹安装器。file 是这次上传自己的文件，不是"最新那份"。 */
+    private void install(File apk) {
+        if (destroyed) {
+            return;
+        }
         status.setText("接收完成，正在打开安装器…");
         Intent intent = new Intent(Intent.ACTION_VIEW);
         // 必须 setDataAndType：分开调 setData/setType 会互相清空
         intent.setDataAndType(
-                Uri.parse("content://" + getPackageName() + ".apk/received.apk"),
+                Uri.parse("content://" + getPackageName() + ".apk/" + apk.getName()),
                 "application/vnd.android.package-archive");
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
         try {
@@ -125,12 +131,6 @@ public class MainActivity extends Activity {
      *  否则界面照常显示网址，手机怎么连都连不上，完全无从排查。 */
     private void listenFailed() {
         status.setText("启动失败：8080 端口被占用，手机连不上。\n请按遥控器返回键退出 App，再重新打开。");
-    }
-
-    private void deleteTemp() {
-        if (temp != null && temp.exists()) {
-            temp.delete();
-        }
     }
 
     /** 取第一个可用的局域网 IPv4；跳过回环、链路本地、IPv6 和点对点网卡。 */
